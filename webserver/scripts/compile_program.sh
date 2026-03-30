@@ -111,6 +111,8 @@ elif [ "$OPENPLC_PLATFORM" = "linux" ]; then
         g++ -std=gnu++11 *.cpp *.o -o openplc -I ./lib -pthread -fpermissive `pkg-config --cflags --libs libmodbus` -lsnap7 -lasiodnp3 -lasiopal -lopendnp3 -lopenpal -lrt -w $ETHERCAT_INC -DSL_RP4
     elif [ "$OPENPLC_DRIVER" = "synergy_logic" ]; then
         g++ -std=gnu++11 *.cpp *.o -o openplc -I ./lib -pthread -fpermissive `pkg-config --cflags --libs libmodbus` -lsnap7 -lasiodnp3 -lasiopal -lopendnp3 -lopenpal -lrt -w $ETHERCAT_INC -DSYNERGY
+    elif [ "$OPENPLC_DRIVER" = "psm_linux" ]; then
+        g++ -std=gnu++11 *.cpp *.o -o openplc -I ./lib -pthread -fpermissive `pkg-config --cflags --libs libmodbus` -lsnap7 -lasiodnp3 -lasiopal -lopendnp3 -lopenpal -lrt -w $ETHERCAT_INC -lwiringPi
     else
         g++ -std=gnu++11 *.cpp *.o -o openplc -I ./lib -pthread -fpermissive `pkg-config --cflags --libs libmodbus` -lsnap7 -lasiodnp3 -lasiopal -lopendnp3 -lopenpal -lrt -w $ETHERCAT_INC 
     fi
