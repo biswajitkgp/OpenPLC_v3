@@ -35,6 +35,10 @@
 #include <sys/time.h>
 #include <errno.h>
 #include <string.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/wait.h>
 
 #include <atomic>
 
@@ -73,6 +77,7 @@ static std::atomic<bool> connected(false);
 static pthread_t comm_thread;
 static pthread_t psm_thread;
 static int psm_socket = -1;
+static std::atomic<pid_t> psm_child_pid(-1);
 static pthread_mutex_t socketLock = PTHREAD_MUTEX_INITIALIZER;
 
 static uint16_t analog_inputs_shadow[ANALOG_REG_COUNT] = {0};
@@ -100,51 +105,166 @@ static bool check_error_limit_and_log()
     return false;
 }
 
-//----------------------------------------------------------------------------- 
+//-----------------------------------------------------------------------------
 // PSM runner thread - starts python interpreter and streams logs
 //-----------------------------------------------------------------------------
+static bool launch_psm_process(pid_t *child_pid, int *log_fd, const char **used_launcher)
+{
+    const char *launchers[] = {"../.venv/bin/python3", "./.venv/bin/python3", "python3"};
+
+    for (size_t i = 0; i < ARRAY_SIZE(launchers); i++)
+    {
+        int pipefd[2];
+        if (pipe(pipefd) != 0)
+        {
+            log_errno("PSM: pipe() failed");
+            return false;
+        }
+
+        pid_t pid = fork();
+        if (pid < 0)
+        {
+            close(pipefd[0]);
+            close(pipefd[1]);
+            log_errno("PSM: fork() failed");
+            return false;
+        }
+
+        if (pid == 0)
+        {
+            dup2(pipefd[1], STDOUT_FILENO);
+            dup2(pipefd[1], STDERR_FILENO);
+            close(pipefd[0]);
+            close(pipefd[1]);
+
+            char *const args[] = {(char *)launchers[i], (char *)"-u", (char *)"./core/psm/main.py", NULL};
+            if (i < ARRAY_SIZE(launchers) - 1) execv(launchers[i], args);
+            else execvp(launchers[i], args);
+            _exit(127);
+        }
+
+        close(pipefd[1]);
+
+        int flags = fcntl(pipefd[0], F_GETFL, 0);
+        if (flags >= 0) fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK);
+
+        int status = 0;
+        if (waitpid(pid, &status, WNOHANG) == pid)
+        {
+            close(pipefd[0]);
+            continue;
+        }
+
+        *child_pid = pid;
+        *log_fd = pipefd[0];
+        *used_launcher = launchers[i];
+        return true;
+    }
+
+    return false;
+}
+
 static void *start_psm(void *)
 {
     log_msg("PSM: Starting PSM...\n");
 
-    const char *commands[] = {
-        "../.venv/bin/python3 -u ./core/psm/main.py 2>&1",
-        "./.venv/bin/python3 -u ./core/psm/main.py 2>&1",
-        "python3 -u ./core/psm/main.py 2>&1"
-    };
-
-    FILE *psm_proc = NULL;
+    pid_t child_pid = -1;
+    int log_fd = -1;
     const char *used = NULL;
-    for (size_t i = 0; i < ARRAY_SIZE(commands); i++)
-    {
-        psm_proc = popen(commands[i], "r");
-        if (psm_proc != NULL)
-        {
-            used = commands[i];
-            break;
-        }
-    }
 
-    if (psm_proc == NULL)
+    if (!launch_psm_process(&child_pid, &log_fd, &used))
     {
         log_msg("PSM: Failed to launch Python interpreter for PSM\n");
         return NULL;
     }
 
+    psm_child_pid.store(child_pid);
+
     char launch_msg[256];
-    snprintf(launch_msg, sizeof(launch_msg), "PSM: Python launcher command: %s\n", used);
+    snprintf(launch_msg, sizeof(launch_msg), "PSM: Python launcher command: %s -u ./core/psm/main.py\n", used);
     log_msg(launch_msg);
 
-    char buffer[512];
-    while (!stop_requested.load() && fgets(buffer, sizeof(buffer), psm_proc) != NULL)
+    char line_buffer[1024];
+    size_t used_len = 0;
+
+    while (true)
     {
-        log_msg(buffer);
+        if (stop_requested.load()) break;
+
+        struct pollfd pfd;
+        pfd.fd = log_fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+
+        int pr = poll(&pfd, 1, 200);
+        if (pr > 0 && (pfd.revents & POLLIN))
+        {
+            char chunk[256];
+            ssize_t n = read(log_fd, chunk, sizeof(chunk));
+            if (n > 0)
+            {
+                for (ssize_t i = 0; i < n; i++)
+                {
+                    if (used_len < sizeof(line_buffer) - 1)
+                    {
+                        line_buffer[used_len++] = chunk[i];
+                    }
+
+                    if (chunk[i] == '\n' || used_len == sizeof(line_buffer) - 1)
+                    {
+                        line_buffer[used_len] = '\0';
+                        log_msg(line_buffer);
+                        used_len = 0;
+                    }
+                }
+            }
+            else if (n == 0)
+            {
+                break;
+            }
+            else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+            {
+                break;
+            }
+        }
+
+        int status = 0;
+        pid_t w = waitpid(child_pid, &status, WNOHANG);
+        if (w == child_pid)
+        {
+            if (!stop_requested.load() && (!WIFEXITED(status) || WEXITSTATUS(status) != 0))
+            {
+                log_msg("PSM: Python interpreter exited with non-zero status\n");
+            }
+            child_pid = -1;
+            break;
+        }
+        else if (w < 0 && errno == ECHILD)
+        {
+            child_pid = -1;
+            break;
+        }
     }
 
-    if (pclose(psm_proc) != 0)
+    if (used_len > 0)
     {
-        log_msg("PSM: Python interpreter exited with non-zero status\n");
+        line_buffer[used_len] = '\0';
+        log_msg(line_buffer);
     }
+
+    if (log_fd >= 0) close(log_fd);
+
+    if (child_pid > 0)
+    {
+        int status = 0;
+        waitpid(child_pid, &status, 0);
+        if (!stop_requested.load() && (!WIFEXITED(status) || WEXITSTATUS(status) != 0))
+        {
+            log_msg("PSM: Python interpreter exited with non-zero status\n");
+        }
+    }
+
+    psm_child_pid.store(-1);
 
     return NULL;
 }
@@ -530,6 +650,35 @@ void finalizeHardware()
     {
         pthread_join(comm_thread, NULL);
         comm_thread_started.store(false);
+    }
+
+    pid_t child_pid = psm_child_pid.load();
+    if (child_pid > 0)
+    {
+        kill(child_pid, SIGTERM);
+
+        const int term_wait_ms = 1500;
+        int waited_ms = 0;
+        int status = 0;
+        while (waited_ms < term_wait_ms)
+        {
+            pid_t ret = waitpid(child_pid, &status, WNOHANG);
+            if (ret == child_pid || (ret < 0 && errno == ECHILD))
+            {
+                child_pid = -1;
+                break;
+            }
+            sleepms(50);
+            waited_ms += 50;
+        }
+
+        if (child_pid > 0)
+        {
+            kill(child_pid, SIGKILL);
+            waitpid(child_pid, NULL, 0);
+        }
+
+        psm_child_pid.store(-1);
     }
 
     if (psm_runner_started.load())
