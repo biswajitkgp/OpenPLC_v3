@@ -73,6 +73,7 @@ static std::atomic<bool> connected(false);
 static pthread_t comm_thread;
 static pthread_t psm_thread;
 static int psm_socket = -1;
+static pthread_mutex_t socketLock = PTHREAD_MUTEX_INITIALIZER;
 
 static uint16_t analog_inputs_shadow[ANALOG_REG_COUNT] = {0};
 static uint16_t analog_outputs_shadow[ANALOG_REG_COUNT] = {0};
@@ -151,7 +152,7 @@ static void *start_psm(void *)
 static void kill_psm()
 {
     log_msg("PSM: Killing previous PSM modules...\n");
-    FILE *psm_proc = popen("ps aux | grep './core/psm/main.py' | awk '{print $2}'", "r");
+    FILE *psm_proc = popen("pgrep -f 'python3 -u ./core/psm/main.py'", "r");
     if (psm_proc == NULL)
     {
         log_msg("PSM: Failed to enumerate old PSM processes\n");
@@ -164,8 +165,24 @@ static void kill_psm()
         int pid = atoi(line);
         if (pid > 0)
         {
-            char cmd[64];
-            snprintf(cmd, sizeof(cmd), "kill -9 %d", pid);
+            char cmd[96];
+            snprintf(cmd, sizeof(cmd), "kill -TERM %d >/dev/null 2>&1", pid);
+            system(cmd);
+        }
+    }
+    pclose(psm_proc);
+
+    sleepms(200);
+    psm_proc = popen("pgrep -f 'python3 -u ./core/psm/main.py'", "r");
+    if (psm_proc == NULL) return;
+
+    while (fgets(line, sizeof(line), psm_proc) != NULL)
+    {
+        int pid = atoi(line);
+        if (pid > 0)
+        {
+            char cmd[96];
+            snprintf(cmd, sizeof(cmd), "kill -KILL %d >/dev/null 2>&1", pid);
             system(cmd);
         }
     }
@@ -276,7 +293,7 @@ static bool read_modbus_frame(int fd, uint8_t *frame, size_t max_len, size_t *fr
     if (!read_exact(fd, frame, 7)) return false;
 
     uint16_t mbap_len = ((uint16_t)frame[4] << 8) | frame[5];
-    if (mbap_len == 0 || (size_t)(6 + mbap_len) > max_len) return false;
+    if (mbap_len < 2 || (size_t)(6 + mbap_len) > max_len) return false;
 
     size_t remain = mbap_len - 1; // uid already read in byte 6
     if (!read_exact(fd, frame + 7, remain)) return false;
@@ -293,6 +310,9 @@ static bool read_analog_inputs_once(int fd)
 
     if (!send_all(fd, request, sizeof(request))) return false;
     if (!read_modbus_frame(fd, response, sizeof(response), &response_len)) return false;
+    if (response_len != (size_t)(9 + ANALOG_REG_COUNT * 2)) return false;
+    if (response[2] != 0x00 || response[3] != 0x00) return false;
+    if (response[6] != MB_UID) return false;
 
     if (response[7] != 0x04) return false;
     if (response[8] != (ANALOG_REG_COUNT * 2)) return false;
@@ -350,6 +370,9 @@ static bool write_analog_outputs_once(int fd)
 
     if (!send_all(fd, request, sizeof(request))) return false;
     if (!read_modbus_frame(fd, response, sizeof(response), &response_len)) return false;
+    if (response_len < 12) return false;
+    if (response[2] != 0x00 || response[3] != 0x00) return false;
+    if (response[6] != MB_UID) return false;
 
     if (response[7] != 0x10) return false;
     if (response[10] != 0x00 || response[11] != ANALOG_REG_COUNT) return false;
@@ -369,6 +392,9 @@ static bool send_stop_signal_once(int fd)
 
     if (!send_all(fd, request, sizeof(request))) return false;
     if (!read_modbus_frame(fd, response, sizeof(response), &response_len)) return false;
+    if (response_len < 12) return false;
+    if (response[2] != 0x00 || response[3] != 0x00) return false;
+    if (response[6] != MB_UID) return false;
 
     if (response[7] != 0x06) return false;
     if (response[8] != 0x00 || response[9] != KILL_REG_ADDR) return false;
@@ -382,34 +408,43 @@ static bool send_stop_signal_once(int fd)
 
 static void *psm_comm_loop(void *)
 {
+    int local_socket = -1;
+
     while (!stop_requested.load())
     {
         if (check_error_limit_and_log()) break;
 
-        if (psm_socket < 0)
+        if (local_socket < 0)
         {
             connected.store(false);
-            psm_socket = connect_to_psm(false);
-            if (psm_socket < 0)
+            local_socket = connect_to_psm(false);
+            if (local_socket < 0)
             {
                 sleepms(RECONNECT_DELAY_MS);
                 continue;
             }
+
+            pthread_mutex_lock(&socketLock);
+            psm_socket = local_socket;
+            pthread_mutex_unlock(&socketLock);
 
             connected.store(true);
             error_count.store(0);
             log_msg("PSM: Connected to PSM\n");
         }
 
-        bool ok = read_analog_inputs_once(psm_socket) && write_analog_outputs_once(psm_socket);
+        bool ok = read_analog_inputs_once(local_socket) && write_analog_outputs_once(local_socket);
         if (!ok)
         {
             error_count.fetch_add(1);
             connected.store(false);
             log_msg("PSM: I/O exchange failed, reconnecting...\n");
-            shutdown(psm_socket, SHUT_RDWR);
-            close(psm_socket);
+            shutdown(local_socket, SHUT_RDWR);
+            close(local_socket);
+            local_socket = -1;
+            pthread_mutex_lock(&socketLock);
             psm_socket = -1;
+            pthread_mutex_unlock(&socketLock);
             sleepms(RECONNECT_DELAY_MS);
             continue;
         }
@@ -417,12 +452,27 @@ static void *psm_comm_loop(void *)
         sleepms(COMM_LOOP_DELAY_MS);
     }
 
+    if (local_socket >= 0)
+    {
+        send_stop_signal_once(local_socket);
+        shutdown(local_socket, SHUT_RDWR);
+        close(local_socket);
+    }
+
+    pthread_mutex_lock(&socketLock);
+    psm_socket = -1;
+    pthread_mutex_unlock(&socketLock);
+    connected.store(false);
+
     return NULL;
 }
 
 void initializeHardware()
 {
-    wiringPiSetup();
+    if (wiringPiSetup() == -1)
+    {
+        log_msg("PSM: wiringPiSetup failed\n");
+    }
 
     for (int i = 0; i < MAX_INPUT; i++)
     {
@@ -476,22 +526,10 @@ void finalizeHardware()
 {
     stop_requested.store(true);
 
-    if (psm_socket >= 0)
-    {
-        send_stop_signal_once(psm_socket);
-        shutdown(psm_socket, SHUT_RDWR);
-    }
-
     if (comm_thread_started.load())
     {
         pthread_join(comm_thread, NULL);
         comm_thread_started.store(false);
-    }
-
-    if (psm_socket >= 0)
-    {
-        close(psm_socket);
-        psm_socket = -1;
     }
 
     if (psm_runner_started.load())
